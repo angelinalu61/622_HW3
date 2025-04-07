@@ -1,6 +1,6 @@
 ---
 title: "ML"
-author: "Angelina Lu"
+author: "Angelina Lu, Johnia Johansen Kakiziba, Kailin Xu, and Kehinde Adeniyi"
 date: "2025-04-01"
 output: pdf_document
 ---
