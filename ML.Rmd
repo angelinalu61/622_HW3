@@ -1,0 +1,214 @@
+---
+title: "ML"
+author: "Angelina Lu"
+date: "2025-04-01"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(tidytext)
+library(tm)
+library(textstem)
+library(caret) # Stratified Sampling
+library(dplyr)
+library(e1071) # SVM
+library(caret) # KNN
+library(class) # KNN
+```
+
+
+
+```{r}
+reddit_data <- read.csv('merged_data.csv', stringsAsFactors = FALSE)
+
+# Create stance based on score values
+reddit_data <- reddit_data %>%
+  mutate(stance = case_when(
+    score > 0 ~ "Favorable",
+    score < 0 ~ "Oppose",
+    TRUE ~ "Neutral"
+  )) %>%
+  mutate(stance = as.factor(stance))
+```
+
+After performing simple random sampling (SRS), only 400 records were retained. Such a random sample may lead to some issues. The original dataset includes three stance categories: Favorable, Neutral, and Oppose. However, after random sampling, the Neutral and Oppose classes may have extremely few samples, or even just 0 or 1 instance.
+
+As a result, when performing cross-validation, training, or evaluating models such as K-Nearest Neighbors (KNN), the model is exposed almost exclusively to the Favorable class. This leads to evaluation metrics like Sensitivity or Positive Predictive Value showing NaN values.
+
+These metrics are calculated as TP / (TP + FN).  If the denominator is zero—such as when the model never predicts or encounters examples from a class—the result is NaN.
+
+Therefore, stratified sampling was ultimately chosen to ensure that samples were drawn proportionally from each stance category, preserving class balance in the dataset.
+
+```{r}
+# Stratified sampling (take proportional, fixed sample size from each stance)
+set.seed(100)
+sample_index <- createDataPartition(reddit_data$stance, p = 400 / nrow(reddit_data), list = FALSE)
+reddit_data <- reddit_data[sample_index, ]
+
+reddit_data$post_id <- as.character(reddit_data$comment_id)
+sum(is.na(reddit_data$comment))
+sum(reddit_data$comment == "")
+glimpse(reddit_data)
+
+# Text preprocessing (using the comment column)
+reddit_corpus <- Corpus(VectorSource(reddit_data$comment))
+reddit_corpus <- tm_map(reddit_corpus, content_transformer(tolower))
+reddit_corpus <- tm_map(reddit_corpus, removeNumbers)
+reddit_corpus <- tm_map(reddit_corpus, removePunctuation)
+reddit_corpus <- tm_map(reddit_corpus, removeWords, stopwords("english"))
+reddit_corpus <- tm_map(reddit_corpus, lemmatize_words)
+
+# Build Term-Document Matrix
+reddit_dtm <- DocumentTermMatrix(reddit_corpus)
+
+# Remove sparse terms (appearing in less than 1% of posts)
+reddit_dtm <- removeSparseTerms(reddit_dtm, 0.99)
+
+# Convert to data frame
+reddit_dtm_df <- as.data.frame(as.matrix(reddit_dtm))
+reddit_dtm_df$post_id <- reddit_data$post_id
+reddit_dtm_df$stance <- reddit_data$stance
+
+glimpse(reddit_dtm_df)
+write.csv(reddit_data, "reddit_stratified_400.csv", row.names = FALSE)
+```
+
+## Dataset Split
+```{r}
+# Data splitting (80% training, 20% testing)
+set.seed(100)
+test <- reddit_dtm_df %>% sample_frac(.2)
+train <- reddit_dtm_df %>% anti_join(test, by = 'post_id') %>% select(-post_id)
+test <- test %>% select(-post_id)
+
+# Ensure valid feature names
+colnames(train) <- make.names(colnames(train))
+colnames(test) <- make.names(colnames(test))
+
+test_raw <- reddit_dtm_df %>% sample_frac(.2)
+write.csv(test_raw, "reddit_test_set_with_id.csv", row.names = FALSE)
+```
+
+## Model Development
+### Support Vector Machine (SVM)
+```{r}
+svm_model <- svm(stance ~ ., data = train, kernel = 'linear', cost = 1)
+svm_pred <- predict(svm_model, test)
+svm_cm <- confusionMatrix(svm_pred, test$stance)
+print("SVM Confusion Matrix:")
+print(svm_cm)
+```
+
+### K-Nearest Neighbors (KNN)
+```{r}
+# Create training and testing datasets for features and labels
+train_features <- train %>% select(-stance)
+test_features <- test %>% select(-stance)
+
+train_label <- train$stance
+test_label <- test$stance
+
+# Build KNN model (K=3)
+set.seed(100) 
+knn_pred <- knn(train = train_features, 
+                test = test_features, 
+                cl = train_label, 
+                k = 3)
+
+pred_actual <- data.frame(predicted = knn_pred, actual = test_label)
+head(pred_actual)
+
+# Confusion matrix and model performance metrics
+knn_cm <- confusionMatrix(pred_actual$predicted, pred_actual$actual)
+
+print("KNN Confusion Matrix:")
+print(knn_cm)
+
+# Precision and Recall for each class (multi-class classification)
+precision_recall <- knn_cm$byClass[, c("Pos Pred Value", "Sensitivity")]
+print("Precision and Recall by Class (KNN):")
+print(precision_recall)
+
+# Compute and display average Precision and Recall
+avg_precision <- mean(precision_recall[, "Pos Pred Value"], na.rm=TRUE)
+avg_recall <- mean(precision_recall[, "Sensitivity"], na.rm=TRUE)
+
+cat("KNN Accuracy:", knn_cm$overall['Accuracy'], "\n")
+cat("KNN Average Precision:", avg_precision, "\n")
+cat("KNN Average Recall:", avg_recall, "\n")
+```
+
+To ensure that every stance category is represented in the dataset, stratified sampling was used instead of simple random sampling to select 400 data points.
+
+However, the results of model development still show NaN or zero values. This is mainly due to the extremely imbalanced distribution of classes in the original data. Even with stratified sampling, categories like Neutral and Oppose may still have very few examples.
+
+For instance:
+
+If Neutral accounts for only 5% of the total data, it would contribute around 20 records to the sample. If Oppose accounts for 7.5%, that’s only about 30 records.
+
+After splitting the 400-sample dataset into 80% training and 20% testing, the test set might end up with only about 4 Neutral and 6 Oppose examples.
+
+With such small numbers, the model may fail to detect these minority classes entirely—leading to sensitivity values of 0 and precision values of NaN.
+
+## Model Evaluation
+```{r}
+# Function to calculate F1-score
+calculate_f1 <- function(precision, recall){
+  (2 * precision * recall) / (precision + recall)
+}
+
+# Calculate metrics for SVM
+svm_accuracy <- svm_cm$overall['Accuracy']
+svm_precision <- mean(svm_cm$byClass[, "Pos Pred Value"], na.rm=TRUE)
+svm_recall <- mean(svm_cm$byClass[, "Sensitivity"], na.rm=TRUE)
+svm_f1 <- calculate_f1(svm_precision, svm_recall)
+cat("SVM metrics:", "\n","Accuracy:", svm_accuracy, "\n","Precision:", svm_precision,"\n","Recall:", svm_recall,"\n","F1 Score:", svm_f1, "\n")
+
+# Calculate metrics for KNN
+knn_accuracy <- knn_cm$overall['Accuracy']
+knn_precision <- mean(knn_cm$byClass[, "Pos Pred Value"], na.rm=TRUE)
+knn_recall <- mean(knn_cm$byClass[, "Sensitivity"], na.rm=TRUE)
+knn_f1 <- calculate_f1(knn_precision, knn_recall)
+cat("KNN metrics:", "\n","Accuracy:", knn_accuracy, "\n","Precision:", knn_precision,"\n","Recall:", knn_recall,"\n","F1 Score:", knn_f1, "\n")
+
+# Compare based on Accuracy and F1 Score
+if (svm_accuracy > knn_accuracy & svm_f1 > knn_f1){
+  best_model <- svm_model
+  best_model_name <- "SVM"
+  best_cm <- svm_cm
+  best_pred <- svm_pred
+  best_accuracy <- svm_accuracy
+  best_f1 <- svm_f1
+} else {
+  best_model <- "KNN"
+  best_model_name <- "KNN"
+  best_cm <- knn_cm
+  best_pred <- knn_pred
+  best_accuracy <- knn_accuracy
+  best_f1 <- knn_f1
+}
+
+cat("Best Model Selected:", best_model_name, "\n")
+cat("Accuracy:", best_accuracy, "\n")
+cat("F1 Score:", best_f1, "\n")
+
+# Compare predictions of the best model with manually assigned labels
+result_df <- data.frame(
+  Actual = test$stance,
+  Predicted = best_pred
+)
+
+head(result_df)
+
+output_df <- reddit_data %>%
+  select(post_id, comment, stance)
+write.csv(output_df, "reddit_stratified_400_with_manually_labels.csv", row.names = FALSE)
+```
+
+```
+
